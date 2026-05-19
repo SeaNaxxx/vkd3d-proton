@@ -261,6 +261,8 @@ enum vkd3d_shader_interface_flag
     VKD3D_SHADER_INTERFACE_INSTRUCTION_QA_BUFFER_EXPECT_ASSUME = 0x00000200u,
     VKD3D_SHADER_INTERFACE_INSTRUCTION_QA_BUFFER_SYNC          = 0x00000400u,
     VKD3D_SHADER_INTERFACE_INSTRUCTION_QA_BUFFER_SYNC_COMPUTE  = 0x00000800u,
+    VKD3D_SHADER_INTERFACE_HEAP_LOWERING                       = 0x00001000u,
+    VKD3D_SHADER_INTERFACE_INLINE_REDZONE_CBV                  = 0x00002000u,
 };
 
 struct vkd3d_shader_stage_io_entry
@@ -319,6 +321,7 @@ struct vkd3d_shader_interface_info
 
     /* Used for either VKD3D_SHADER_INTERFACE_RAW_VA_ALIAS_DESCRIPTOR_BUFFER or local root signatures. */
     uint32_t descriptor_size_cbv_srv_uav;
+    uint32_t raw_uav_counter_offset;
     uint32_t descriptor_size_sampler;
 
     /* Purely for debug. Only non-NULL when running with EXTENDED_DEBUG_UTILS. */

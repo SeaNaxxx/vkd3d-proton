@@ -96,6 +96,7 @@ static const struct vkd3d_optional_extension_info optional_device_extensions[] =
     VK_EXTENSION(KHR_PRESENT_WAIT_2, KHR_present_wait2),
     VK_EXTENSION(EXT_PRESENT_TIMING, EXT_present_timing),
     VK_EXTENSION(KHR_DEVICE_ADDRESS_COMMANDS, KHR_device_address_commands),
+    VK_EXTENSION_COND(KHR_OPACITY_MICROMAP, KHR_opacity_micromap, VKD3D_CONFIG_FLAG_STATIC(DXR_1_2)),
 #ifdef _WIN32
     VK_EXTENSION(KHR_EXTERNAL_MEMORY_WIN32, KHR_external_memory_win32),
     VK_EXTENSION(KHR_EXTERNAL_SEMAPHORE_WIN32, KHR_external_semaphore_win32),
@@ -741,7 +742,7 @@ static const struct vkd3d_instance_application_meta application_override[] = {
     /* Ark Ascended (2399830). Very broken FSR3 usage where the entire thing is freed. We can retain the resources automatically
      * but descriptor heap is not named, so we cannot auto-detect. Similar story for the PSOs. */
     { VKD3D_STRING_COMPARE_EXACT, "ArkAscended.exe",
-        VKD3D_CONFIG_FLAG_INIT_STATIC(.RETAIN_DESCRIPTOR_HEAPS = 1, .RETAIN_PSOS = 1) },
+        VKD3D_CONFIG_FLAG_INIT_STATIC(.RETAIN_PSOS = 1) },
     { VKD3D_STRING_COMPARE_NEVER, NULL },
 };
 
@@ -1630,7 +1631,7 @@ bool d3d12_device_supports_ray_tracing_tier_1_0(const struct d3d12_device *devic
 
 bool d3d12_device_supports_ray_tracing_tier_1_2(const struct d3d12_device *device)
 {
-    return device->device_info.opacity_micromap_features.micromap &&
+    return device->device_info.supports_opacity_micromap &&
             device->d3d12_caps.options5.RaytracingTier >= D3D12_RAYTRACING_TIER_1_2;
 }
 
@@ -2447,10 +2448,16 @@ static void vkd3d_physical_device_info_init(struct vkd3d_physical_device_info *i
         vk_prepend_struct(&info->features2, &info->device_address_commands_features);
     }
 
+    if (vulkan_info->KHR_opacity_micromap)
+    {
+        info->opacity_micromap_features_khr.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_OPACITY_MICROMAP_FEATURES_KHR;
+        vk_prepend_struct(&info->features2, &info->opacity_micromap_features_khr);
+    }
+
     if (vulkan_info->EXT_opacity_micromap)
     {
-        info->opacity_micromap_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_OPACITY_MICROMAP_FEATURES_EXT;
-        vk_prepend_struct(&info->features2, &info->opacity_micromap_features);
+        info->opacity_micromap_features_ext.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_OPACITY_MICROMAP_FEATURES_EXT;
+        vk_prepend_struct(&info->features2, &info->opacity_micromap_features_ext);
     }
 
     if (vulkan_info->EXT_shader_float8)
@@ -2522,6 +2529,17 @@ static void vkd3d_physical_device_info_init(struct vkd3d_physical_device_info *i
 
     VK_CALL(vkGetPhysicalDeviceFeatures2(device->vk_physical_device, &info->features2));
     VK_CALL(vkGetPhysicalDeviceProperties2(device->vk_physical_device, &info->properties2));
+
+    /* TODO: Until KHR is fully plumbed in, we will only support EXT */
+    info->opacity_micromap_features_khr.micromap = VK_FALSE;
+
+    /* Prefer KHR_opacity_micromap over EXT_opacity_micromap, and only load one. */
+    info->using_khr_opacity_micromap = info->opacity_micromap_features_khr.micromap;
+
+    if (info->using_khr_opacity_micromap)
+        info->opacity_micromap_features_ext.micromap = VK_FALSE;
+
+    info->supports_opacity_micromap = info->using_khr_opacity_micromap || info->opacity_micromap_features_ext.micromap;
 
     /* if nonzero, this is a layered implementation */
     if (real_driver_props.driverID)
@@ -2935,6 +2953,15 @@ static void vkd3d_trace_physical_device_features(const struct vkd3d_physical_dev
     TRACE("  VkPhysicalDeviceLineRasterizationFeaturesEXT:\n");
     TRACE("    rectangularLines: %u\n", info->line_rasterization_features.rectangularLines);
     TRACE("    smoothLines: %u\n", info->line_rasterization_features.smoothLines);
+
+    TRACE("  VkPhysicalDeviceOpacityMicromapFeaturesEXT:\n");
+
+    TRACE("    micromap: %#x\n", info->opacity_micromap_features_ext.micromap);
+    TRACE("    micromapCaptureReplay: %#x\n", info->opacity_micromap_features_ext.micromapCaptureReplay);
+    TRACE("    micromapHostCommands: %#x\n", info->opacity_micromap_features_ext.micromapHostCommands);
+
+    TRACE("  VkPhysicalDeviceOpacityMicromapFeaturesKHR:\n");
+    TRACE("    micromap: %#x\n", info->opacity_micromap_features_khr.micromap);
 }
 
 static HRESULT vkd3d_init_device_extensions(struct d3d12_device *device,
@@ -3866,8 +3893,10 @@ static void d3d12_device_init_workarounds(struct d3d12_device *device)
     if (VKD3D_CONFIG_FLAG_IS_SET(SKIP_DRIVER_WORKAROUNDS))
         return;
 
-    if (device->device_info.vulkan_1_2_properties.driverID == VK_DRIVER_ID_MESA_RADV)
+    if (device->device_info.vulkan_1_2_properties.driverID == VK_DRIVER_ID_MESA_RADV &&
+        device->device_info.properties2.properties.driverVersion < VK_MAKE_VERSION(26, 2, 0))
     {
+        /* Fixed in RADV 26.2+. */
         if (device->device_info.properties2.properties.limits.maxImageDimension1D < 32768 &&
             device->device_info.compute_shader_derivatives_features_khr.computeDerivativeGroupQuads)
         {
@@ -9370,7 +9399,7 @@ static D3D12_RAYTRACING_TIER d3d12_device_determine_ray_tracing_tier(struct d3d1
         }
     }
 
-    if (tier == D3D12_RAYTRACING_TIER_1_1 && info->opacity_micromap_features.micromap)
+    if (tier == D3D12_RAYTRACING_TIER_1_1 && info->supports_opacity_micromap)
     {
         INFO("DXR 1.2 support enabled.\n");
         tier = D3D12_RAYTRACING_TIER_1_2;
@@ -10496,7 +10525,7 @@ static void vkd3d_init_shader_extensions(struct d3d12_device *device)
                 VKD3D_SHADER_TARGET_EXTENSION_RAW_ACCESS_CHAINS_NV;
     }
 
-    if (device->device_info.opacity_micromap_features.micromap)
+    if (device->device_info.supports_opacity_micromap)
     {
         device->vk_info.shader_extensions[device->vk_info.shader_extension_count++] =
                 VKD3D_SHADER_TARGET_EXTENSION_OPACITY_MICROMAP;
