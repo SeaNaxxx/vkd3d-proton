@@ -191,7 +191,6 @@ struct vkd3d_vulkan_info
     bool EXT_device_address_binding_report;
     bool EXT_depth_bias_control;
     bool EXT_zero_initialize_device_memory;
-    bool EXT_opacity_micromap;
     bool EXT_shader_float8;
     bool EXT_present_timing;
     bool EXT_descriptor_heap;
@@ -2410,7 +2409,7 @@ struct d3d12_pipeline_state
 #ifdef VKD3D_ENABLE_PROFILING
     struct
     {
-        size_t pso_entry_index;
+        uint32_t pso_entry_index;
     } timestamp_profiler;
 #endif
 };
@@ -3493,7 +3492,7 @@ struct d3d12_command_list
     struct
     {
         struct d3d12_pipeline_state *active_timestamp_state;
-        size_t timestamp_index;
+        uint32_t timestamp_index;
 
         struct vkd3d_timestamp_profiler_submitted_work *work;
         size_t work_count;
