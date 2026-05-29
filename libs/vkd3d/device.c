@@ -736,13 +736,22 @@ static const struct vkd3d_instance_application_meta application_override[] = {
     /* Crimson Desert (3321460).
      * Game advertises being able to run on RDNA1, but when we don't expose some RDNA2+ features,
      * it just exits on startup. It seems to rely on unstable barycentrics, which we can implement on older AMD,
-     * and VRS can be nooped. */
-    { VKD3D_STRING_COMPARE_EXACT, "CrimsonDesert.exe", VKD3D_CONFIG_FLAGS_NONE, VKD3D_CONFIG_FLAGS_NONE,
+     * and VRS can be nooped. Recent game update has broken raw buffer <-> image aliasing. */
+    { VKD3D_STRING_COMPARE_EXACT, "CrimsonDesert.exe", VKD3D_CONFIG_FLAG_STATIC(AVOID_IMAGE_BUFFER_ALIASING), VKD3D_CONFIG_FLAGS_NONE,
         VKD3D_APPLICATION_FEATURE_RDNA1_COMPATIBILITY | VKD3D_APPLICATION_FEATURE_VIEW_INSTANCING },
     /* Ark Ascended (2399830). Very broken FSR3 usage where the entire thing is freed. We can retain the resources automatically
      * but descriptor heap is not named, so we cannot auto-detect. Similar story for the PSOs. */
     { VKD3D_STRING_COMPARE_EXACT, "ArkAscended.exe",
         VKD3D_CONFIG_FLAG_INIT_STATIC(.RETAIN_PSOS = 1) },
+    /* Forza Horizon 6 (2483190).
+     * Completely broken case where it writes a texture descriptor and reads it as a buffer.
+     * With 32b embedded model on RDNA3/4, this causes a GPU hang.
+     * Lots of jank is needed to make this work:
+     * Co-siting buffers and images was attempted, but we ran into HW bugs.
+     * The only reasonable solution is to completely firewall images and raw buffers from each other by
+     * forcing 64b descriptors on heap or rely on 64b drirc workaround in RADV for DB path. */
+    { VKD3D_STRING_COMPARE_EXACT, "forzahorizon6.exe", VKD3D_CONFIG_FLAG_INIT_STATIC(
+        .AVOID_IMAGE_BUFFER_ALIASING = 1, .NO_STAGGERED_SUBMIT = 1) },
     { VKD3D_STRING_COMPARE_NEVER, NULL },
 };
 
@@ -843,6 +852,13 @@ static const struct vkd3d_shader_quirk_info witcher3_quirks = {
 
 static const struct vkd3d_shader_quirk_info heap_robustness_quirks = {
     NULL, 0, VKD3D_SHADER_QUIRK_DESCRIPTOR_HEAP_ROBUSTNESS,
+};
+
+static const struct vkd3d_shader_quirk_info forza6_quirks = {
+    NULL, 0,
+    /* Tons of OOB access in RT, even for sampler heap.
+     * Also, lots of missed nonuniformEXT in RT, so force that ... */
+    VKD3D_SHADER_QUIRK_DESCRIPTOR_HEAP_ROBUSTNESS | VKD3D_SHADER_QUIRK_FORCE_NONUNIFORM_RT,
 };
 
 static const struct vkd3d_shader_quirk_hash ac_mirage_hashes[] = {
@@ -1116,6 +1132,8 @@ static const struct vkd3d_shader_quirk_meta application_shader_quirks[] = {
     { VKD3D_STRING_COMPARE_EXACT, "Spider-Man2.exe", &spiderman2_quirks },
     /* PRAGMATA (3357650) */
     { VKD3D_STRING_COMPARE_STARTS_WITH, "PRAGMATA", &pragmata_quirks },
+    /* Forza Horizon 6 (2483190). */
+    { VKD3D_STRING_COMPARE_EXACT, "forzahorizon6.exe", &forza6_quirks },
     /* MSVC fails to compile empty array. */
     { VKD3D_STRING_COMPARE_NEVER, NULL, NULL },
 };
@@ -2468,8 +2486,8 @@ static void vkd3d_physical_device_info_init(struct vkd3d_physical_device_info *i
 
     if (vulkan_info->KHR_opacity_micromap)
     {
-        info->opacity_micromap_features_khr.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_OPACITY_MICROMAP_FEATURES_KHR;
-        vk_prepend_struct(&info->features2, &info->opacity_micromap_features_khr);
+        info->opacity_micromap_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_OPACITY_MICROMAP_FEATURES_KHR;
+        vk_prepend_struct(&info->features2, &info->opacity_micromap_features);
     }
 
     if (vulkan_info->EXT_shader_float8)
@@ -2542,10 +2560,7 @@ static void vkd3d_physical_device_info_init(struct vkd3d_physical_device_info *i
     VK_CALL(vkGetPhysicalDeviceFeatures2(device->vk_physical_device, &info->features2));
     VK_CALL(vkGetPhysicalDeviceProperties2(device->vk_physical_device, &info->properties2));
 
-    /* Prefer KHR_opacity_micromap over EXT_opacity_micromap, and only load one. */
-    info->using_khr_opacity_micromap = info->opacity_micromap_features_khr.micromap;
-
-    info->supports_opacity_micromap = info->using_khr_opacity_micromap;
+    info->supports_opacity_micromap = info->opacity_micromap_features.micromap;
 
     /* if nonzero, this is a layered implementation */
     if (real_driver_props.driverID)
@@ -2961,7 +2976,7 @@ static void vkd3d_trace_physical_device_features(const struct vkd3d_physical_dev
     TRACE("    smoothLines: %u\n", info->line_rasterization_features.smoothLines);
 
     TRACE("  VkPhysicalDeviceOpacityMicromapFeaturesKHR:\n");
-    TRACE("    micromap: %#x\n", info->opacity_micromap_features_khr.micromap);
+    TRACE("    micromap: %#x\n", info->opacity_micromap_features.micromap);
 }
 
 static HRESULT vkd3d_init_device_extensions(struct d3d12_device *device,
@@ -4425,16 +4440,6 @@ static HRESULT d3d12_device_create_query_pool(struct d3d12_device *device, uint3
 
         case VKD3D_QUERY_TYPE_INDEX_RT_SERIALIZE_SIZE_BOTTOM_LEVEL_POINTERS:
             pool_info.queryType = VK_QUERY_TYPE_ACCELERATION_STRUCTURE_SERIALIZATION_BOTTOM_LEVEL_POINTERS_KHR;
-            pool_info.queryCount = 128;
-            break;
-
-        case VKD3D_QUERY_TYPE_INDEX_OMM_COMPACTED_SIZE:
-            pool_info.queryType = VK_QUERY_TYPE_MICROMAP_COMPACTED_SIZE_EXT;
-            pool_info.queryCount = 128;
-            break;
-
-        case VKD3D_QUERY_TYPE_INDEX_OMM_SERIALIZE_SIZE:
-            pool_info.queryType = VK_QUERY_TYPE_MICROMAP_SERIALIZATION_SIZE_EXT;
             pool_info.queryCount = 128;
             break;
 
@@ -8387,19 +8392,13 @@ static void d3d12_device_get_raytracing_opacity_micromap_array_prebuild_info(str
         const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS *desc,
         D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO *info)
 {
-    VkAccelerationStructureGeometryMicromapDataKHR geometry_micromap_data_khr;
+    VkAccelerationStructureGeometryMicromapDataKHR geometry_micromap_data;
     const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
-    VkAccelerationStructureBuildGeometryInfoKHR build_info_khr;
-    union
-    {
-        VkMicromapUsageEXT ext[VKD3D_BUILD_INFO_STACK_COUNT];
-        VkMicromapUsageKHR khr[VKD3D_BUILD_INFO_STACK_COUNT];
-    } usages_stack;
-    VkAccelerationStructureBuildSizesInfoKHR size_info_khr;
-    VkAccelerationStructureGeometryKHR geometry_info_khr;
-    VkMicromapBuildSizesInfoEXT size_info_ext;
-    VkMicromapBuildInfoEXT build_info_ext;
-    union vkd3d_omm_usage_info usages;
+    VkMicromapUsageKHR usages_stack[VKD3D_BUILD_INFO_STACK_COUNT];
+    VkAccelerationStructureBuildGeometryInfoKHR build_info;
+    VkAccelerationStructureBuildSizesInfoKHR size_info;
+    VkAccelerationStructureGeometryKHR geometry_info;
+    VkMicromapUsageKHR *usages;
     uint32_t usages_count;
 
     if (!d3d12_device_supports_ray_tracing_tier_1_2(device))
@@ -8412,58 +8411,26 @@ static void d3d12_device_get_raytracing_opacity_micromap_array_prebuild_info(str
     usages_count = desc->pOpacityMicromapArrayDesc->NumOmmHistogramEntries;
 
     if (usages_count > VKD3D_BUILD_INFO_STACK_COUNT)
-    {
-        if (device->device_info.using_khr_opacity_micromap)
-            usages.khr = vkd3d_malloc(usages_count * sizeof(*usages.khr));
-        else
-            usages.ext = vkd3d_malloc(usages_count * sizeof(*usages.ext));
-    }
+        usages = vkd3d_malloc(usages_count * sizeof(*usages));
     else
+        usages = usages_stack;
+
+    if (!vkd3d_opacity_micromap_convert_inputs(device, desc, &build_info, &geometry_info,
+            &geometry_micromap_data, usages))
     {
-        if (device->device_info.using_khr_opacity_micromap)
-            usages.khr = usages_stack.khr;
-        else
-            usages.ext = usages_stack.ext;
+        ERR("Failed to convert inputs.\n");
+        memset(info, 0, sizeof(*info));
+        goto cleanup;
     }
 
-    if (device->device_info.using_khr_opacity_micromap)
-    {
-        if (!vkd3d_opacity_micromap_convert_inputs_khr(device, desc, &build_info_khr, &geometry_info_khr,
-                &geometry_micromap_data_khr, usages.khr))
-        {
-            ERR("Failed to convert inputs.\n");
-            memset(info, 0, sizeof(*info));
-            goto cleanup;
-        }
+    memset(&size_info, 0, sizeof(size_info));
+    size_info.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR;
 
-        memset(&size_info_khr, 0, sizeof(size_info_khr));
-        size_info_khr.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR;
+    VK_CALL(vkGetAccelerationStructureBuildSizesKHR(device->vk_device,
+            VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR, &build_info, NULL, &size_info));
 
-        VK_CALL(vkGetAccelerationStructureBuildSizesKHR(device->vk_device,
-                VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR, &build_info_khr, NULL, &size_info_khr));
-
-        info->ResultDataMaxSizeInBytes = size_info_khr.accelerationStructureSize;
-        info->ScratchDataSizeInBytes = size_info_khr.buildScratchSize;
-    }
-    else
-    {
-        if (!vkd3d_opacity_micromap_convert_inputs_ext(device, desc, &build_info_ext, usages.ext))
-        {
-            ERR("Failed to convert inputs.\n");
-            memset(info, 0, sizeof(*info));
-            goto cleanup;
-        }
-
-        memset(&size_info_ext, 0, sizeof(size_info_ext));
-        size_info_ext.sType = VK_STRUCTURE_TYPE_MICROMAP_BUILD_SIZES_INFO_EXT;
-
-        VK_CALL(vkGetMicromapBuildSizesEXT(device->vk_device,
-                VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR, &build_info_ext, &size_info_ext));
-
-        info->ResultDataMaxSizeInBytes = size_info_ext.micromapSize;
-        info->ScratchDataSizeInBytes = size_info_ext.buildScratchSize;
-    }
-
+    info->ResultDataMaxSizeInBytes = size_info.accelerationStructureSize;
+    info->ScratchDataSizeInBytes = size_info.buildScratchSize;
     info->UpdateScratchDataSizeInBytes = 0;
 
     TRACE("ResultDataMaxSizeInBytes: %"PRIu64".\n", (uint64_t)info->ResultDataMaxSizeInBytes);
@@ -8472,12 +8439,7 @@ static void d3d12_device_get_raytracing_opacity_micromap_array_prebuild_info(str
 cleanup:
 
     if (usages_count > VKD3D_BUILD_INFO_STACK_COUNT)
-    {
-        if (device->device_info.using_khr_opacity_micromap)
-            vkd3d_free(usages.khr);
-        else
-            vkd3d_free(usages.ext);
-    }
+        vkd3d_free(usages);
 }
 
 static void STDMETHODCALLTYPE d3d12_device_GetRaytracingAccelerationStructurePrebuildInfo(d3d12_device_iface *iface,
@@ -8486,15 +8448,11 @@ static void STDMETHODCALLTYPE d3d12_device_GetRaytracingAccelerationStructurePre
 {
     struct d3d12_device *device = impl_from_ID3D12Device(iface);
 
-    union
-    {
-        VkAccelerationStructureTrianglesOpacityMicromapEXT ext[VKD3D_BUILD_INFO_STACK_COUNT];
-        VkAccelerationStructureTrianglesOpacityMicromapKHR khr[VKD3D_BUILD_INFO_STACK_COUNT];
-    } omm_triangles_infos_stack;
+    VkAccelerationStructureTrianglesOpacityMicromapKHR omm_triangles_infos_stack[VKD3D_BUILD_INFO_STACK_COUNT];
     VkAccelerationStructureGeometryKHR geometries_stack[VKD3D_BUILD_INFO_STACK_COUNT];
     const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
     uint32_t primitive_counts_stack[VKD3D_BUILD_INFO_STACK_COUNT];
-    union vkd3d_omm_triangles_info omm_triangles_infos;
+    VkAccelerationStructureTrianglesOpacityMicromapKHR *omm_triangles_infos;
     VkAccelerationStructureBuildGeometryInfoKHR build_info;
     VkAccelerationStructureBuildSizesInfoKHR size_info;
     VkAccelerationStructureGeometryKHR *geometries;
@@ -8519,22 +8477,13 @@ static void STDMETHODCALLTYPE d3d12_device_GetRaytracingAccelerationStructurePre
     geometry_count = vkd3d_acceleration_structure_get_geometry_count(desc);
     primitive_counts = primitive_counts_stack;
     geometries = geometries_stack;
+    omm_triangles_infos = omm_triangles_infos_stack;
 
     if (geometry_count > VKD3D_BUILD_INFO_STACK_COUNT)
     {
         primitive_counts = vkd3d_malloc(geometry_count * sizeof(*primitive_counts));
         geometries = vkd3d_malloc(geometry_count * sizeof(*geometries));
-        if (device->device_info.using_khr_opacity_micromap)
-            omm_triangles_infos.khr = vkd3d_malloc(geometry_count * sizeof(*omm_triangles_infos.khr));
-        else
-            omm_triangles_infos.ext = vkd3d_malloc(geometry_count * sizeof(*omm_triangles_infos.ext));
-    }
-    else
-    {
-        if (device->device_info.using_khr_opacity_micromap)
-            omm_triangles_infos.khr = omm_triangles_infos_stack.khr;
-        else
-            omm_triangles_infos.ext = omm_triangles_infos_stack.ext;
+        omm_triangles_infos = vkd3d_malloc(geometry_count * sizeof(*omm_triangles_infos));
     }
 
     if (!vkd3d_acceleration_structure_convert_inputs(device,
@@ -8568,10 +8517,7 @@ cleanup:
     {
         vkd3d_free(primitive_counts);
         vkd3d_free(geometries);
-        if (device->device_info.using_khr_opacity_micromap)
-            vkd3d_free(omm_triangles_infos.khr);
-        else
-            vkd3d_free(omm_triangles_infos.ext);
+        vkd3d_free(omm_triangles_infos);
     }
 }
 
@@ -9621,12 +9567,16 @@ uint32_t d3d12_device_get_max_descriptor_heap_size(struct d3d12_device *device, 
             }
 
         case D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER:
-            if (d3d12_device_use_descriptor_heap(device) && device->memory_info.has_gpu_upload_heap)
+            if (d3d12_device_use_descriptor_heap(device) && device->memory_info.has_gpu_upload_heap &&
+                !d3d12_descriptor_heap_require_padding_descriptors(device))
             {
                 /* Meta shaders need embedded samplers in some cases, so we cannot potentially expose the larger limits. */
                 VkDeviceSize useable_size =
                     device->device_info.descriptor_heap_properties.maxSamplerHeapSize -
                     device->device_info.descriptor_heap_properties.minSamplerHeapReservedRangeWithEmbedded;
+
+                /* For padding scenarios, we rely on allocating 2048 samplers for every heap
+                 * and clamp to 2047 since we cannot sneak in a proper redzone descriptor on NV. */
 
                 /* Don't report ridiculously large numbers here for safety. Limit the number of descriptors. */
                 uint32_t count = min(1000000, useable_size >> device->bindless_state.sampler_size_log2);
